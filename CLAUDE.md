@@ -131,6 +131,6 @@ Human-readable error details are also written to stderr.
 
 - Public profiles only.
 - Local audio uploads bypass Instagram entirely.
-- Instagram may rate-limit anonymous requests.
+- Instagram may rate-limit anonymous requests. Public reels work anonymously; if Instagram login-walls a public link, set `REELRECON_COOKIES_FILE` (cookies.txt export) or `REELRECON_COOKIES_FROM_BROWSER=chrome` to use your own session.
 - The wrapper prefers Python 3.11 when available to avoid `yt-dlp` Python 3.9 deprecation noise.
 - The wrapper prefers the repo-local `.venv` first when present.

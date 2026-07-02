@@ -302,6 +302,8 @@ All optional, via environment variables:
 | `REELRECON_MAX_CONCURRENT_JOBS` | `1` | Parallel transcription jobs (MCP) |
 | `REELRECON_MAX_UPLOAD_BYTES` | 2 GiB | Max local audio file size (MCP) |
 | `REELRECON_EXTRA_MODELS` | — | Comma-separated extra Whisper model names to allow |
+| `REELRECON_COOKIES_FILE` | — | Path to a `cookies.txt` export of your own Instagram session (fallback when Instagram login-walls anonymous access) |
+| `REELRECON_COOKIES_FROM_BROWSER` | — | Read your session straight from a browser, e.g. `chrome` or `firefox:ProfileName` |
 | `REELRECON_HTTP_TIMEOUT_SECONDS` | `30` | Instagram/Groq/yt-dlp socket timeout |
 | `REELRECON_FETCH_RETRIES` | `3` | Instagram profile fetch attempts (with backoff) |
 
@@ -322,6 +324,7 @@ The MCP server and pipeline helpers ship with a lightweight suite (no Whisper/to
 
 - **Public profiles only** — private accounts are detected and refused.
 - Instagram may rate-limit anonymous requests; the tool retries with backoff, but if it's blocked, wait and rerun.
+- **Hitting Instagram's login wall on a public reel?** Public videos normally work anonymously (the same access you get after dismissing the login popup in a browser). If Instagram keeps refusing, supply your own logged-in session: set `REELRECON_COOKIES_FILE` to a `cookies.txt` export, or `REELRECON_COOKIES_FROM_BROWSER=chrome`. Your session, your account, your responsibility — keep it to research-scale use.
 - Whisper models are cached after first load; already-transcribed videos are reused on reruns.
 - Everything runs locally. The only network calls are to Instagram/video hosts, and (optionally) GroqCloud with your key.
 - Agent-facing docs live in [`CLAUDE.md`](CLAUDE.md) — most MCP-aware coding agents pick it up automatically.

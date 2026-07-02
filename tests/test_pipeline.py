@@ -92,3 +92,59 @@ def test_run_audio_file_transcription_validates_input(tmp_path: Path):
     empty.touch()
     with pytest.raises(pipeline.PipelineError, match="empty"):
         pipeline.run_audio_file_transcription(empty, output_dir=tmp_path)
+
+
+def test_cookie_settings_missing_file_raises(monkeypatch):
+    monkeypatch.setenv("REELRECON_COOKIES_FILE", "/does/not/exist/cookies.txt")
+    with pytest.raises(pipeline.PipelineError, match="missing file"):
+        pipeline.cookie_settings()
+
+
+def test_cookie_settings_and_yt_dlp_options(monkeypatch, tmp_path):
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    monkeypatch.setenv("REELRECON_COOKIES_FILE", str(cookies))
+
+    cookies_file, cookies_browser = pipeline.cookie_settings()
+    assert cookies_file == str(cookies)
+    assert cookies_browser is None
+    assert pipeline._yt_dlp_base_options()["cookiefile"] == str(cookies)
+
+    monkeypatch.delenv("REELRECON_COOKIES_FILE")
+    monkeypatch.setenv("REELRECON_COOKIES_FROM_BROWSER", "firefox:MyProfile")
+    assert pipeline._yt_dlp_base_options()["cookiesfrombrowser"] == ("firefox", "MyProfile")
+
+    monkeypatch.delenv("REELRECON_COOKIES_FROM_BROWSER")
+    options = pipeline._yt_dlp_base_options()
+    assert "cookiefile" not in options and "cookiesfrombrowser" not in options
+
+
+def test_instagram_cookie_header(monkeypatch, tmp_path):
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".instagram.com\tTRUE\t/\tTRUE\t1993456000\tsessionid\tabc123\n"
+        ".instagram.com\tTRUE\t/\tTRUE\t1993456000\tcsrftoken\ttok\n"
+        ".example.com\tTRUE\t/\tFALSE\t1993456000\tother\tx\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REELRECON_COOKIES_FILE", str(cookies))
+    header = pipeline._instagram_cookie_header()
+    assert "sessionid=abc123" in header
+    assert "csrftoken=tok" in header
+    assert "other=x" not in header
+
+    monkeypatch.delenv("REELRECON_COOKIES_FILE")
+    assert pipeline._instagram_cookie_header() is None
+
+
+def test_download_error_login_wall_hint():
+    err = pipeline._download_error(
+        Exception("Requested content is not available, rate-limit reached or login required"),
+        "https://www.instagram.com/reel/abc/",
+        "downloading audio for",
+    )
+    assert "REELRECON_COOKIES_FILE" in str(err)
+
+    plain = pipeline._download_error(Exception("connection reset"), "https://example.com/v", "inspecting")
+    assert "REELRECON_COOKIES_FILE" not in str(plain)

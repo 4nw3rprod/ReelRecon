@@ -936,6 +936,7 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
             "output_root_writable": output_root_writable,
             "saved_batches": len(_recent_manifest_paths(MAX_LIST_LIMIT)),
             "groq_configured": bool(os.environ.get("GROQ_API_KEY")),
+            "instagram_cookies_configured": bool(_env("COOKIES_FILE") or _env("COOKIES_FROM_BROWSER")),
             "jobs": {
                 "active": _active_jobs,
                 "abandoned_after_timeout": _abandoned_jobs,

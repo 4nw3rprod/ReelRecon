@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from hashlib import sha1
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.error import HTTPError, URLError
@@ -23,10 +24,18 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.
 warnings.filterwarnings("ignore", message="Support for Python version 3.9 has been deprecated.*")
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+def _env_str(name: str) -> Optional[str]:
     # REELRECON_* is the primary prefix; the legacy IG_TRANSCRIBER_* prefix
     # remains supported so existing setups keep working after the rename.
-    raw = os.environ.get(f"REELRECON_{name}", os.environ.get(f"IG_TRANSCRIBER_{name}", default))
+    for key in (f"REELRECON_{name}", f"IG_TRANSCRIBER_{name}"):
+        value = os.environ.get(key)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = _env_str(name) or default
     try:
         return max(int(raw), minimum)
     except (TypeError, ValueError):
@@ -269,21 +278,35 @@ def detect_input_kind(input_url: str) -> tuple[str, str]:
     return "video", input_url
 
 
+def _instagram_cookie_header() -> Optional[str]:
+    cookies_file, _ = cookie_settings()
+    if not cookies_file:
+        return None
+    jar = MozillaCookieJar()
+    try:
+        jar.load(cookies_file, ignore_discard=True, ignore_expires=True)
+    except Exception:
+        return None
+    pairs = [f"{cookie.name}={cookie.value}" for cookie in jar if "instagram.com" in (cookie.domain or "")]
+    return "; ".join(pairs) if pairs else None
+
+
 def fetch_profile(username: str, canonical_url: str) -> Dict[str, Any]:
     api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    cookie_header = _instagram_cookie_header()
 
     payload: Optional[Dict[str, Any]] = None
     last_error: Optional[PipelineError] = None
     for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
-        request = Request(
-            api_url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "x-ig-app-id": INSTAGRAM_APP_ID,
-                "Referer": canonical_url,
-                "Accept": "application/json",
-            },
-        )
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "x-ig-app-id": INSTAGRAM_APP_ID,
+            "Referer": canonical_url,
+            "Accept": "application/json",
+        }
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        request = Request(api_url, headers=headers)
         try:
             with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
                 payload = json.load(response)
@@ -294,7 +317,9 @@ def fetch_profile(username: str, canonical_url: str) -> Dict[str, Any]:
                 raise PipelineError(f"Instagram profile not found: {canonical_url}") from exc
             if exc.code in {401, 403}:
                 raise PipelineError(
-                    "Instagram blocked the profile lookup. This pipeline currently supports public profiles only."
+                    "Instagram blocked the anonymous profile lookup. Only public profiles are supported. "
+                    "If this profile is public and the block persists, supply your own logged-in session via "
+                    "REELRECON_COOKIES_FILE (a cookies.txt export) and retry."
                 ) from exc
             if exc.code == 429:
                 last_error = PipelineError(
@@ -405,8 +430,56 @@ def collect_instagram_profile_videos(canonical_url: str) -> list[VideoCandidate]
     ]
 
 
+def cookie_settings() -> tuple[Optional[str], Optional[str]]:
+    """Optional own-session cookies for when Instagram hard-walls anonymous access.
+
+    Public reels normally work anonymously (same as playing the video after
+    dismissing the login popup in a browser). When Instagram rate-limits or
+    login-walls anonymous requests, users can supply their own logged-in
+    session: REELRECON_COOKIES_FILE (a Netscape cookies.txt export) or
+    REELRECON_COOKIES_FROM_BROWSER (e.g. "chrome", "firefox:ProfileName").
+    """
+    cookies_file = _env_str("COOKIES_FILE")
+    if cookies_file:
+        path = Path(cookies_file).expanduser()
+        if not path.is_file():
+            raise PipelineError(
+                f"REELRECON_COOKIES_FILE points to a missing file: {path}. "
+                "Export a cookies.txt from your logged-in browser (e.g. the 'Get cookies.txt' extension) "
+                "or unset the variable to use anonymous access."
+            )
+        cookies_file = str(path)
+    return cookies_file, _env_str("COOKIES_FROM_BROWSER")
+
+
+_LOGIN_WALL_MARKERS = (
+    "login required",
+    "log in",
+    "login",
+    "rate-limit",
+    "rate limit",
+    "requested content is not available",
+    "checkpoint required",
+    "checkpoint_required",
+)
+
+
+def _download_error(exc: Exception, target_url: str, action: str) -> PipelineError:
+    text = str(exc).strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in _LOGIN_WALL_MARKERS):
+        return PipelineError(
+            f"Instagram refused anonymous access while {action} {target_url}: {text} — "
+            "this usually means the video is private/removed, or Instagram is rate-limiting anonymous requests. "
+            "If the link plays in a private browser window (after dismissing the login popup), wait a few minutes and retry, "
+            "or supply your own logged-in session: set REELRECON_COOKIES_FILE to a cookies.txt export, or "
+            "REELRECON_COOKIES_FROM_BROWSER=chrome (also: firefox, edge, safari, brave)."
+        )
+    return PipelineError(f"Failed while {action} {target_url}: {text}")
+
+
 def _yt_dlp_base_options() -> Dict[str, Any]:
-    return {
+    options: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -415,15 +488,26 @@ def _yt_dlp_base_options() -> Dict[str, Any]:
         "fragment_retries": 3,
         "extractor_retries": 2,
     }
+    cookies_file, cookies_browser = cookie_settings()
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+    elif cookies_browser:
+        options["cookiesfrombrowser"] = tuple(
+            part.strip() for part in cookies_browser.split(":") if part.strip()
+        )
+    return options
 
 
 def _yt_dlp_extract_info(target_url: str) -> Dict[str, Any]:
     YoutubeDL = _import_yt_dlp()
+    options = _yt_dlp_base_options()
     try:
-        with YoutubeDL(_yt_dlp_base_options()) as ydl:
+        with YoutubeDL(options) as ydl:
             info = ydl.extract_info(target_url, download=False)
+    except PipelineError:
+        raise
     except Exception as exc:
-        raise PipelineError(f"Failed to inspect video URL: {exc}") from exc
+        raise _download_error(exc, target_url, "inspecting") from exc
     if not isinstance(info, dict):
         raise PipelineError(f"Could not extract video information from URL: {target_url}")
     return info
@@ -827,8 +911,10 @@ def download_audio(candidate: VideoCandidate, run_dir: Path) -> Path:
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(candidate.video_url, download=True)
+    except PipelineError:
+        raise
     except Exception as exc:
-        raise PipelineError(f"Failed to download audio for {candidate.video_url}: {exc}") from exc
+        raise _download_error(exc, candidate.video_url, "downloading audio for") from exc
     if not isinstance(info, dict) or not info.get("id"):
         raise PipelineError(f"yt-dlp did not return download metadata for {candidate.video_url}")
 

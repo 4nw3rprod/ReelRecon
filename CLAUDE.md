@@ -63,6 +63,9 @@ This starts the server over stdio. The MCP surface exposes:
 - `list_recent_batches`
 - `read_batch_manifest`
 - `read_video_output`
+- `check_health`
+
+MCP tools never raise for expected failures: every tool returns `status: "ok"` or `status: "error"` with `error_type`, `error`, and usually a `hint`. Use `check_health` to diagnose setup problems (whisper/yt-dlp/ffmpeg availability, output directory writability, job activity). Use `include_transcript_text=false` or `max_transcript_chars` to keep tool responses small; full transcripts stay on disk and behind the transcript resources. In multi-video batches a failing video is recorded with `status: "error"` and counted in `failed_videos` instead of aborting the batch. Server limits (job timeout, concurrency, upload size) are tunable via `IG_TRANSCRIBER_*` environment variables documented in the README.
 
 Resources:
 

@@ -85,6 +85,7 @@ MCP tools exposed:
 - `list_recent_batches`
 - `read_batch_manifest`
 - `read_video_output`
+- `check_health`
 
 MCP resources exposed:
 
@@ -92,6 +93,23 @@ MCP resources exposed:
 - `ig-transcriber://recent-batches`
 - `ig-transcriber://manifest/{source_group}/{source_label}`
 - `ig-transcriber://transcript/{source_group}/{source_label}/{video_id}`
+
+### MCP error contract
+
+Tools never raise for expected failures. Every tool returns a JSON object with `status`: `"ok"` or `"error"`. Errors include `error_type` (`invalid_input`, `dependency_error`, `output_dir_error`, `pipeline_error`, `not_found`, `server_busy`, `timeout`, `internal_error`), a human-readable `error`, and usually a `hint`. Call `check_health` first when transcription tools fail unexpectedly — it reports dependency status (whisper, yt-dlp, ffmpeg), output-directory writability, and job activity.
+
+Large responses can be trimmed with `include_transcript_text=false` or `max_transcript_chars` on the transcription and read tools; full transcripts always remain on disk and via the `ig-transcriber://transcript/...` resources. In multi-video profile batches, a failing video no longer aborts the batch: it is recorded in `videos` with `status: "error"` and counted in `failed_videos`.
+
+### MCP server tuning (environment variables)
+
+- `IG_TRANSCRIBER_OUTPUT_DIR` — output root (default: `<repo>/outputs`)
+- `IG_TRANSCRIBER_JOB_TIMEOUT_SECONDS` — hard per-job timeout (default: 3600)
+- `IG_TRANSCRIBER_QUEUE_TIMEOUT_SECONDS` — max wait for a job slot (default: 900)
+- `IG_TRANSCRIBER_MAX_CONCURRENT_JOBS` — parallel transcription jobs (default: 1)
+- `IG_TRANSCRIBER_MAX_UPLOAD_BYTES` — max local audio file size (default: 2 GiB)
+- `IG_TRANSCRIBER_EXTRA_MODELS` — comma-separated extra Whisper model names to allow
+- `IG_TRANSCRIBER_HTTP_TIMEOUT_SECONDS` — Instagram/Groq/yt-dlp socket timeout (default: 30)
+- `IG_TRANSCRIBER_FETCH_RETRIES` — Instagram profile fetch attempts (default: 3)
 
 ## Web UI
 
@@ -142,6 +160,15 @@ Files created:
 - `transcript.txt`
 - `metadata.json`
 - `manifest.json` at the batch/source level
+
+## Tests
+
+The MCP server and pipeline helpers are covered by a lightweight test suite that only needs `mcp` and `pytest` (no whisper/torch download):
+
+```bash
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest tests/ -q
+```
 
 ## Notes
 

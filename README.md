@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/4nw3rprod/IG-Content-Transcriber/main/assets/hero.png" alt="ReelRecon — Reel reconnaissance for AI agents. Works with Claude, ChatGPT, Gemini, Hermes, OpenClaw, and any MCP-capable agent." width="820"/>
+<img src="https://raw.githubusercontent.com/4nw3rprod/ReelRecon/main/assets/hero.png" alt="ReelRecon — Reel reconnaissance for AI agents. Works with Claude, ChatGPT, Gemini, Hermes, OpenClaw, and any MCP-capable agent." width="820"/>
 
 **Transcribe and decode any public Instagram profile — hooks, CTAs, and script patterns — locally and for free.**
 
@@ -20,7 +20,7 @@ npx -y reelrecon
 
 [🤖 Agent Setup](#-drop-it-into-your-agent-stack) · [🚀 Quick Start](#-quick-start) · [🔍 Use Cases](#-what-your-agent-can-do-with-it) · [🧰 Tool Reference](#-mcp-tool-reference) · [🖥️ Web UI](#️-the-dashboard-for-humans)
 
-<img src="https://raw.githubusercontent.com/4nw3rprod/IG-Content-Transcriber/main/screen.png" alt="ReelRecon dashboard" width="850"/>
+<img src="https://raw.githubusercontent.com/4nw3rprod/ReelRecon/main/screen.png" alt="ReelRecon dashboard" width="850"/>
 
 </div>
 
@@ -56,7 +56,7 @@ npx -y reelrecon transcribe "https://www.instagram.com/<username>/" --json
 
 > Already have Python + deps? Set `REELRECON_PYTHON=/path/to/python` to skip provisioning and use your own environment.
 >
-> Package not on npm yet in your region/registry? Run it straight from GitHub — same launcher: `npx -y github:4nw3rprod/IG-Content-Transcriber`
+> Package not on npm yet in your region/registry? Run it straight from GitHub — same launcher: `npx -y github:4nw3rprod/ReelRecon`
 
 | Agent / Framework | Integration |
 |---|---|

@@ -64,9 +64,12 @@ def main() -> int:
         print(f"Videos processed: {result['completed_videos']}/{result['total_videos']}")
         print(f"Manifest file: {result['manifest_file']}")
         for video in result["videos"]:
-            print(f"- {video['title']}")
-            print(f"  Video URL: {video['video_url']}")
-            print(f"  Transcript: {video['transcript_file']}")
+            print(f"- {video.get('title')}")
+            print(f"  Video URL: {video.get('video_url')}")
+            if video.get("status") == "ok":
+                print(f"  Transcript: {video.get('transcript_file')}")
+            else:
+                print(f"  FAILED: {video.get('error', 'unknown error')}")
     return 0
 
 

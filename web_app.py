@@ -203,7 +203,8 @@ class JobManager:
                 ("transcript_url", "transcript_file"),
                 ("metadata_url", "metadata_file"),
             ):
-                enriched_video[key] = self._asset_url(video[result_key])
+                file_path = video.get(result_key)
+                enriched_video[key] = self._asset_url(file_path) if file_path else None
             videos.append(enriched_video)
         enriched["videos"] = videos
         return enriched

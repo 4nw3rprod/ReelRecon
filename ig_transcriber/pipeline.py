@@ -5,6 +5,8 @@ import math
 import os
 import re
 import shutil
+import tempfile
+import time
 import warnings
 from collections import Counter
 from dataclasses import dataclass
@@ -20,12 +22,17 @@ from urllib.request import Request, urlopen
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+.*")
 warnings.filterwarnings("ignore", message="Support for Python version 3.9 has been deprecated.*")
 
-import whisper
-from yt_dlp import YoutubeDL
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(int(os.environ.get(name, default)), minimum)
+    except (TypeError, ValueError):
+        return default
 
 
 INSTAGRAM_APP_ID = "936619743392459"
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = _env_int("IG_TRANSCRIBER_HTTP_TIMEOUT_SECONDS", 30, minimum=1)
+FETCH_RETRY_ATTEMPTS = _env_int("IG_TRANSCRIBER_FETCH_RETRIES", 3, minimum=1)
 INSTAGRAM_VIDEO_LIMIT = 10
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
@@ -138,6 +145,55 @@ class PipelineError(RuntimeError):
     pass
 
 
+def _import_whisper() -> Any:
+    # Imported lazily: pulling in whisper/torch takes seconds and should not
+    # delay (or crash) callers that never transcribe, such as MCP server startup.
+    try:
+        import whisper
+    except Exception as exc:
+        raise PipelineError(
+            f"The 'openai-whisper' package is not usable: {exc}. "
+            "Install dependencies with: pip install -r requirements.txt"
+        ) from exc
+    return whisper
+
+
+def _import_yt_dlp() -> Any:
+    try:
+        from yt_dlp import YoutubeDL
+    except Exception as exc:
+        raise PipelineError(
+            f"The 'yt-dlp' package is not usable: {exc}. "
+            "Install dependencies with: pip install -r requirements.txt"
+        ) from exc
+    return YoutubeDL
+
+
+def require_ffmpeg() -> str:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise PipelineError(
+            "ffmpeg was not found on PATH. It is required for audio extraction and transcription. "
+            "Install it (e.g. `apt install ffmpeg` or `brew install ffmpeg`) and retry."
+        )
+    return ffmpeg_path
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    # Write via a temp file in the same directory and atomically replace, so a
+    # crash mid-write can never leave a truncated/corrupt file behind.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 @dataclass(frozen=True)
 class VideoCandidate:
     source_kind: str
@@ -162,8 +218,12 @@ def _emit(progress_callback: Optional[ProgressCallback], stage: str, percent: in
 
 
 def _safe_slug(value: str, fallback: str = "item") -> str:
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
-    return slug or fallback
+    # Strip leading/trailing dots too so a slug can never be a path-traversal
+    # component like "." or "..".
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-.").lower()
+    if not slug or set(slug) <= {".", "-"}:
+        return fallback
+    return slug
 
 
 def _timestamp_to_iso(timestamp: int) -> Optional[str]:
@@ -208,31 +268,51 @@ def detect_input_kind(input_url: str) -> tuple[str, str]:
 
 def fetch_profile(username: str, canonical_url: str) -> Dict[str, Any]:
     api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    request = Request(
-        api_url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "x-ig-app-id": INSTAGRAM_APP_ID,
-            "Referer": canonical_url,
-            "Accept": "application/json",
-        },
-    )
 
-    try:
-        with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-            payload = json.load(response)
-    except HTTPError as exc:
-        if exc.code == 404:
-            raise PipelineError(f"Instagram profile not found: {canonical_url}") from exc
-        if exc.code in {401, 403}:
-            raise PipelineError(
-                "Instagram blocked the profile lookup. This pipeline currently supports public profiles only."
-            ) from exc
-        if exc.code == 429:
-            raise PipelineError("Instagram rate-limited the request. Wait and try again.") from exc
-        raise PipelineError(f"Instagram profile lookup failed with HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise PipelineError(f"Network error while fetching Instagram profile: {exc.reason}") from exc
+    payload: Optional[Dict[str, Any]] = None
+    last_error: Optional[PipelineError] = None
+    for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+        request = Request(
+            api_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "x-ig-app-id": INSTAGRAM_APP_ID,
+                "Referer": canonical_url,
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+                payload = json.load(response)
+            last_error = None
+            break
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise PipelineError(f"Instagram profile not found: {canonical_url}") from exc
+            if exc.code in {401, 403}:
+                raise PipelineError(
+                    "Instagram blocked the profile lookup. This pipeline currently supports public profiles only."
+                ) from exc
+            if exc.code == 429:
+                last_error = PipelineError(
+                    "Instagram rate-limited the request. Wait a few minutes and try again."
+                )
+            elif exc.code >= 500:
+                last_error = PipelineError(f"Instagram profile lookup failed with HTTP {exc.code}")
+            else:
+                raise PipelineError(f"Instagram profile lookup failed with HTTP {exc.code}") from exc
+        except URLError as exc:
+            last_error = PipelineError(f"Network error while fetching Instagram profile: {exc.reason}")
+        except (json.JSONDecodeError, TimeoutError) as exc:
+            last_error = PipelineError(f"Instagram returned an unreadable profile response: {exc}")
+
+        if attempt < FETCH_RETRY_ATTEMPTS:
+            time.sleep(min(2 ** attempt, 10))
+
+    if last_error is not None:
+        raise last_error
+    if not isinstance(payload, dict):
+        raise PipelineError("Instagram returned an unexpected profile response")
 
     user = payload.get("data", {}).get("user")
     if not user:
@@ -322,12 +402,28 @@ def collect_instagram_profile_videos(canonical_url: str) -> list[VideoCandidate]
     ]
 
 
+def _yt_dlp_base_options() -> Dict[str, Any]:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": DEFAULT_TIMEOUT_SECONDS,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+    }
+
+
 def _yt_dlp_extract_info(target_url: str) -> Dict[str, Any]:
+    YoutubeDL = _import_yt_dlp()
     try:
-        with YoutubeDL({"quiet": True, "no_warnings": True, "noprogress": True}) as ydl:
-            return ydl.extract_info(target_url, download=False)
+        with YoutubeDL(_yt_dlp_base_options()) as ydl:
+            info = ydl.extract_info(target_url, download=False)
     except Exception as exc:
         raise PipelineError(f"Failed to inspect video URL: {exc}") from exc
+    if not isinstance(info, dict):
+        raise PipelineError(f"Could not extract video information from URL: {target_url}")
+    return info
 
 
 def collect_direct_video(target_url: str) -> list[VideoCandidate]:
@@ -653,6 +749,34 @@ def build_video_result(
     }
 
 
+def _failed_video_result(candidate: VideoCandidate, error: str) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "error": error,
+        "source_kind": candidate.source_kind,
+        "platform": candidate.platform,
+        "source_label": candidate.source_label,
+        "position": candidate.position,
+        "total_videos": candidate.total_videos,
+        "video_id": candidate.video_id,
+        "title": candidate.title,
+        "uploader": candidate.uploader,
+        "input_url": candidate.input_url,
+        "canonical_url": candidate.canonical_url,
+        "video_url": candidate.video_url,
+        "caption": candidate.caption,
+        "taken_at_timestamp": candidate.timestamp,
+        "taken_at_iso": _timestamp_to_iso(candidate.timestamp),
+        "audio_file": None,
+        "transcript_file": None,
+        "metadata_file": None,
+        "detected_language": None,
+        "cached": False,
+        "transcript_text": "",
+        "ai_insights": None,
+    }
+
+
 def _load_cached_video_result(candidate: VideoCandidate, run_dir: Path, model_name: str) -> Optional[Dict[str, Any]]:
     audio_path, transcript_path, metadata_path = _paths_for_run(run_dir)
     if not (audio_path.exists() and transcript_path.exists() and metadata_path.exists()):
@@ -679,14 +803,15 @@ def download_audio(candidate: VideoCandidate, run_dir: Path) -> Path:
     if audio_path.exists() and audio_path.stat().st_size > 0:
         return audio_path
 
+    require_ffmpeg()
+    YoutubeDL = _import_yt_dlp()
+
     output_template = str(run_dir / "%(id)s.%(ext)s")
     options = {
+        **_yt_dlp_base_options(),
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -701,6 +826,8 @@ def download_audio(candidate: VideoCandidate, run_dir: Path) -> Path:
             info = ydl.extract_info(candidate.video_url, download=True)
     except Exception as exc:
         raise PipelineError(f"Failed to download audio for {candidate.video_url}: {exc}") from exc
+    if not isinstance(info, dict) or not info.get("id"):
+        raise PipelineError(f"yt-dlp did not return download metadata for {candidate.video_url}")
 
     downloaded_audio_path = run_dir / f"{info['id']}.mp3"
     if not downloaded_audio_path.exists():
@@ -713,11 +840,21 @@ def download_audio(candidate: VideoCandidate, run_dir: Path) -> Path:
         audio_path.unlink(missing_ok=True)
         downloaded_audio_path.replace(audio_path)
 
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        audio_path.unlink(missing_ok=True)
+        raise PipelineError(f"Downloaded audio for {candidate.video_url} is empty")
+
     return audio_path
+
+
+def available_whisper_models() -> list[str]:
+    whisper = _import_whisper()
+    return list(whisper.available_models())
 
 
 @lru_cache(maxsize=4)
 def load_whisper_model(model_name: str) -> Any:
+    whisper = _import_whisper()
     return whisper.load_model(model_name)
 
 
@@ -728,19 +865,25 @@ def transcribe_audio(
     progress_callback: Optional[ProgressCallback] = None,
     percent_range: tuple[int, int] = (55, 85),
 ) -> Dict[str, Any]:
+    require_ffmpeg()
     start, end = percent_range
     midpoint = start + math.floor((end - start) * 0.25)
     _emit(progress_callback, "loading_model", midpoint, f"Loading Whisper model '{model_name}'")
     try:
         model = load_whisper_model(model_name)
+    except PipelineError:
+        raise
     except Exception as exc:
         raise PipelineError(f"Failed to load Whisper model '{model_name}': {exc}") from exc
 
     _emit(progress_callback, "transcribing", end, "Transcribing audio with Whisper")
     try:
-        return model.transcribe(str(audio_path), fp16=False, language=language, verbose=None)
+        result = model.transcribe(str(audio_path), fp16=False, language=language, verbose=None)
     except Exception as exc:
         raise PipelineError(f"Whisper transcription failed: {exc}") from exc
+    if not isinstance(result, dict):
+        raise PipelineError("Whisper returned an unexpected transcription result")
+    return result
 
 
 def write_video_outputs(
@@ -752,7 +895,7 @@ def write_video_outputs(
 ) -> Dict[str, Any]:
     _, transcript_path, metadata_path = _paths_for_run(run_dir)
     transcript_text = (whisper_result.get("text") or "").strip()
-    transcript_path.write_text(transcript_text + ("\n" if transcript_text else ""), encoding="utf-8")
+    _atomic_write_text(transcript_path, transcript_text + ("\n" if transcript_text else ""))
 
     video_result = build_video_result(
         candidate,
@@ -768,7 +911,7 @@ def write_video_outputs(
         **video_result,
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _atomic_write_text(metadata_path, json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
     return video_result
 
 
@@ -814,7 +957,7 @@ def write_batch_manifest(
     source_label: str,
 ) -> Path:
     _, manifest_path = _paths_for_batch(base_output_dir, source_group, source_label)
-    manifest_path.write_text(json.dumps(batch_result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _atomic_write_text(manifest_path, json.dumps(batch_result, indent=2, ensure_ascii=False) + "\n")
     return manifest_path
 
 
@@ -832,10 +975,15 @@ def run_audio_file_transcription(
         raise PipelineError(f"Audio file not found: {source_audio_path}")
     if source_audio_path.stat().st_size <= 0:
         raise PipelineError("The uploaded audio file is empty.")
+    if not os.access(source_audio_path, os.R_OK):
+        raise PipelineError(f"Audio file is not readable: {source_audio_path}")
 
     filename = (original_filename or source_audio_path.name).strip() or source_audio_path.name
     title = Path(filename).stem or "Uploaded audio"
-    file_hash = _file_sha1(source_audio_path)[:10]
+    try:
+        file_hash = _file_sha1(source_audio_path)[:10]
+    except OSError as exc:
+        raise PipelineError(f"Could not read audio file {source_audio_path}: {exc}") from exc
     source_label = _safe_slug(f"{title}-{file_hash}", "audio-upload")
     timestamp = int(source_audio_path.stat().st_mtime)
 
@@ -888,6 +1036,7 @@ def run_audio_file_transcription(
         "language_hint": language,
         "total_videos": 1,
         "completed_videos": 1,
+        "failed_videos": 0,
         "videos": [video_result],
         "ai_overview": generate_batch_ai_overview([video_result]),
     }
@@ -932,14 +1081,27 @@ def run_transcription(
             base_percent,
             f"Processing video {index}/{total}: {candidate.title[:80]}",
         )
-        video_result = process_video(
-            candidate,
-            output_dir=output_root,
-            model_name=model_name,
-            language=language,
-            progress_callback=progress_callback,
-            reuse_existing=reuse_existing,
-        )
+        try:
+            video_result = process_video(
+                candidate,
+                output_dir=output_root,
+                model_name=model_name,
+                language=language,
+                progress_callback=progress_callback,
+                reuse_existing=reuse_existing,
+            )
+        except PipelineError as exc:
+            # In a multi-video batch, one broken video should not abort the
+            # remaining downloads. Record the failure and keep going.
+            if total == 1:
+                raise
+            video_result = _failed_video_result(candidate, str(exc))
+            _emit(
+                progress_callback,
+                "video_failed",
+                base_percent,
+                f"Skipping video {index}/{total} after error: {exc}",
+            )
         video_results.append(video_result)
         completed_percent = 15 + math.floor((index / total) * 75)
         status_message = (
@@ -949,6 +1111,14 @@ def run_transcription(
         )
         _emit(progress_callback, "writing_files", completed_percent, status_message)
 
+    successful_videos = [video for video in video_results if video.get("status") == "ok"]
+    if not successful_videos:
+        errors = "; ".join(
+            str(video.get("error")) for video in video_results if video.get("error")
+        )
+        raise PipelineError(f"All {total} videos failed to transcribe. Errors: {errors or 'unknown'}")
+
+    failed_count = total - len(successful_videos)
     batch_result = {
         "status": "ok",
         "input_kind": input_kind,
@@ -957,9 +1127,10 @@ def run_transcription(
         "model": model_name,
         "language_hint": language,
         "total_videos": total,
-        "completed_videos": len(video_results),
+        "completed_videos": len(successful_videos),
+        "failed_videos": failed_count,
         "videos": video_results,
-        "ai_overview": generate_batch_ai_overview(video_results),
+        "ai_overview": generate_batch_ai_overview(successful_videos),
     }
 
     manifest_path = write_batch_manifest(
@@ -969,5 +1140,8 @@ def run_transcription(
         candidates[0].source_label,
     )
     batch_result["manifest_file"] = str(manifest_path)
-    _emit(progress_callback, "completed", 100, f"Completed transcription for {len(video_results)} video(s)")
+    completed_message = f"Completed transcription for {len(successful_videos)} video(s)"
+    if failed_count:
+        completed_message += f" ({failed_count} failed)"
+    _emit(progress_callback, "completed", 100, completed_message)
     return batch_result

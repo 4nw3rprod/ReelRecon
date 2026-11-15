@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import tempfile
@@ -20,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+.*")
 warnings.filterwarnings("ignore", message="Support for Python version 3.9 has been deprecated.*")
@@ -58,6 +60,11 @@ MAX_FRAMES_LIMIT = 60
 FRAME_WIDTH = 512
 SCENE_THRESHOLD = 0.3
 FFMPEG_TIMEOUT_SECONDS = 300
+# ffmpeg only ever reads local files we downloaded, and only as plain media: no playlists (HLS/concat)
+# that could pull in other local files or URLs from a hostile download.
+FFMPEG_INPUT_GUARD = ["-protocol_whitelist", "file", "-format_whitelist", "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,image2"]
+MAX_COVER_BYTES = 10 * 1024 * 1024
+COVER_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 HOOK_FRAME_STEP_SECONDS = 0.5
 DEFAULT_ANALYSIS_SHOT_FRAMES = 8
 # The hook-analysis method ships as an installable skill; the MCP tools serve the same file.
@@ -1152,9 +1159,14 @@ def download_video(video_url: str, run_dir: Path) -> Path:
 
 
 def _ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
+    guarded: list[str] = []
+    for arg in args:
+        if arg == "-i":
+            guarded += FFMPEG_INPUT_GUARD
+        guarded.append(arg)
     try:
         return subprocess.run(
-            [require_ffmpeg(), "-hide_banner", "-nostdin", *args],
+            [require_ffmpeg(), "-hide_banner", "-nostdin", *guarded],
             capture_output=True,
             text=True,
             timeout=FFMPEG_TIMEOUT_SECONDS,
@@ -1318,18 +1330,58 @@ def analysis_method() -> str:
     return text.strip()
 
 
-def _download_image(url: str, destination: Path) -> bool:
-    """Fetch an image and save it downscaled to FRAME_WIDTH as JPEG. False on any failure."""
-    raw = destination.with_suffix(".source")
+def _is_public_https_url(url: str) -> bool:
+    """Only https URLs whose host resolves solely to public addresses (no loopback, private, link-local)."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
     try:
-        with urlopen(Request(url, headers={"User-Agent": BROWSER_USER_AGENT}), timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-            raw.write_bytes(response.read())
-        _ffmpeg(["-y", "-i", str(raw), "-vf", f"scale='min({FRAME_WIDTH},iw)':-2", "-q:v", "4", str(destination)])
+        addresses = {info[4][0] for info in socket.getaddrinfo(parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)}
+    except (socket.gaierror, UnicodeError):
+        return False
+    return bool(addresses) and all(ipaddress.ip_address(address.split("%")[0]).is_global for address in addresses)
+
+
+class _PublicRedirectsOnly(HTTPRedirectHandler):
+    """Check each redirect hop before it is requested, so a public URL cannot bounce into the local network."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_public_https_url(newurl):
+            raise URLError(f"refused redirect to non-public URL: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_image(url: str, destination: Path) -> bool:
+    """Fetch a cover image and save it downscaled to FRAME_WIDTH as JPEG. False on any failure.
+
+    The URL comes from third-party page data, so it is treated as hostile: https to public hosts only,
+    image content types only, size-capped, and decoded by ffmpeg as a single still image.
+    """
+    # shortcut: the host is checked before urlopen re-resolves it (DNS-rebinding window); acceptable
+    # because the response must also be a size-capped image; pin the resolved IP if this server is exposed.
+    if not _is_public_https_url(url):
+        return False
+    raw: Optional[Path] = None
+    try:
+        opener = build_opener(_PublicRedirectsOnly())
+        with opener.open(Request(url, headers={"User-Agent": BROWSER_USER_AGENT}), timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            extension = COVER_EXTENSIONS.get(content_type)
+            if not extension:
+                return False
+            data = response.read(MAX_COVER_BYTES + 1)
+        if not data or len(data) > MAX_COVER_BYTES:
+            return False
+        raw = destination.with_name(f"cover_source{extension}")
+        raw.write_bytes(data)
+        _ffmpeg(["-y", "-f", "image2", "-i", str(raw), "-frames:v", "1", "-vf", f"scale='min({FRAME_WIDTH},iw)':-2", "-q:v", "4", str(destination)])
         return destination.exists() and destination.stat().st_size > 0
-    except (OSError, URLError, PipelineError):
+    except (OSError, URLError, ValueError, PipelineError):
+        destination.unlink(missing_ok=True)
         return False
     finally:
-        raw.unlink(missing_ok=True)
+        if raw is not None:
+            raw.unlink(missing_ok=True)
 
 
 def fetch_cover(run_dir: Path, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:

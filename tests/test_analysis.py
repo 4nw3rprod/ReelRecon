@@ -101,3 +101,42 @@ def test_cover_is_reused_and_hook_comparison(tmp_path):
     assert first["cover"] == {"file": str(a / "cover.jpg")}
     assert packet["videos"][1]["cover"] is None
     assert packet["performance_summary"]["median"] == 100
+
+
+@pytest.mark.parametrize("url", [
+    "http://example.com/cover.jpg",          # not https
+    "file:///etc/passwd",                    # local file
+    "https://127.0.0.1/cover.jpg",           # loopback
+    "https://169.254.169.254/latest/meta-data",  # cloud metadata
+    "https://10.0.0.5/cover.jpg",            # private network
+    "https://localhost/cover.jpg",
+    "ftp://example.com/x.jpg",
+])
+def test_cover_download_refuses_non_public_urls(url, tmp_path, monkeypatch):
+    def must_not_fetch(*args, **kwargs):
+        raise AssertionError(f"fetched {url}")
+
+    monkeypatch.setattr(pipeline, "build_opener", must_not_fetch)
+    assert pipeline._is_public_https_url(url) is False
+    assert pipeline._download_image(url, tmp_path / "cover.jpg") is False
+
+
+def test_redirect_into_private_network_is_refused():
+    handler = pipeline._PublicRedirectsOnly()
+    with pytest.raises(pipeline.URLError, match="non-public"):
+        handler.redirect_request(None, None, 302, "Found", {}, "https://169.254.169.254/latest/meta-data")
+
+
+@needs_ffmpeg
+def test_ffmpeg_will_not_follow_a_playlist_disguised_as_video(tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET")
+    # .m3u8 makes every ffmpeg version open it as HLS unless the guard refuses the format.
+    evil = tmp_path / "video.m3u8"
+    evil.write_text(f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nfile://{secret}\n#EXT-X-ENDLIST\n")
+    result = pipeline._ffmpeg(["-i", str(evil), "-f", "null", "-"])
+    assert result.returncode != 0
+    assert "not on whitelist" in result.stderr
+    assert "TOP SECRET" not in result.stderr
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.extract_frames(evil, tmp_path / "frames")

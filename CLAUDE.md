@@ -20,6 +20,14 @@ python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+Then connect Instagram, which profile scans require (Instagram hides profiles from logged-out requests):
+
+```bash
+.venv/bin/python -m ig_transcriber.login     # or: npx -y reelrecon login
+```
+
+It is interactive (browser choice, OS keychain prompt), so the user must run it in their own terminal; agents should not run it for them. It saves the session to `~/.reelrecon/instagram_cookies.txt` (mode 600), which every run uses automatically. `--status` checks it, `--logout` deletes it. If `check_health` lists "not connected to Instagram", ask the user to run it.
+
 Optional:
 
 ```bash
@@ -69,6 +77,9 @@ This starts the server over stdio. The MCP surface exposes:
 - `list_recent_batches`
 - `read_batch_manifest`
 - `read_video_output`
+- `get_video_frames`
+- `analyze_video`
+- `compare_hooks`
 - `check_health`
 
 MCP tools never raise for expected failures: every tool returns `status: "ok"` or `status: "error"` with `error_type`, `error`, and usually a `hint`. Use `check_health` to diagnose setup problems (whisper/yt-dlp/ffmpeg availability, output directory writability, job activity). Use `include_transcript_text=false` or `max_transcript_chars` to keep tool responses small; full transcripts stay on disk and behind the transcript resources. In multi-video batches a failing video is recorded with `status: "error"` and counted in `failed_videos` instead of aborting the batch. Server limits (job timeout, concurrency, upload size) are tunable via `REELRECON_*` environment variables (legacy `IG_TRANSCRIBER_*` names still work) documented in the README.
@@ -115,6 +126,12 @@ On success, stdout is a single JSON object with:
 
 Each item in `videos` includes transcript paths, metadata paths, detected language, and `ai_insights`.
 
+For any question about why a video works, its hook, its visuals, its cover, or the creator's strategy, use `analyze_video` (one video: `input_url` or saved ids, plus `question`) or `compare_hooks` (a saved batch). Both return a JSON packet with `analysis_method` (the method in `skills/reelrecon-hook-analyzer/SKILL.md`) followed by labelled images: the cover, then hook-window frames and shot frames. Follow that method: evidence for every claim, strong/adequate/weak bands, never numeric scores, and persuasion levers described as techniques rather than judgements of the creator. Pass `include_method=false` on follow-up calls to save tokens.
+
+For raw frames only, `get_video_frames(source_group, source_label, video_id)` downloads the video once and returns its key frames as images: the opening frame plus one per shot change (sampled about every 3 seconds when there are few cuts), 512px wide, at most `max_frames` (default 12). Each frame has `time_seconds` and `spoken` (the words said at that moment). `transcribe_input(include_frames=true)` (CLI: `--frames`) saves frames for every video in a batch as file paths without returning images. Frames live in each video's `frames/` folder.
+
+Batch results also include `performance`: each video scored against the batch median (`metric` is `views` when every video has a view count, otherwise `engagement` = likes + comments, which Instagram still shows to logged-out requests). `performance.outliers` lists videos at 2x the median or more, with the words spoken in their first 3 seconds. Each video carries `metrics` (views, likes, comments, duration_seconds; `null` when hidden) and `speech` (opening_line, first_3s, speech_starts_at, words_per_minute). Timed Whisper segments are saved in each video's `metadata.json`.
+
 ## Failure contract
 
 On failure, the command exits non-zero.
@@ -129,8 +146,9 @@ Human-readable error details are also written to stderr.
 
 ## Notes
 
-- Public profiles only.
+- Public profiles only (private accounts are refused even if the logged-in user follows them).
+- Profile scans read the latest 10 reels from the profile's Reels tab (pinned reels skipped) via Instagram's web GraphQL query, logged in. If they fail with "unexpected response", Instagram rotated the query ID: set `REELRECON_REELS_DOC_ID` or update the default in `ig_transcriber/pipeline.py`.
 - Local audio uploads bypass Instagram entirely.
-- Instagram may rate-limit anonymous requests. Public reels work anonymously; if Instagram login-walls a public link, set `REELRECON_COOKIES_FILE` (cookies.txt export) or `REELRECON_COOKIES_FROM_BROWSER=chrome` to use your own session.
+- Profile scans need the saved login (above). Single public reels usually work without it. `REELRECON_COOKIES_FILE` / `REELRECON_COOKIES_FROM_BROWSER` override the saved login.
 - The wrapper prefers Python 3.11 when available to avoid `yt-dlp` Python 3.9 deprecation noise.
 - The wrapper prefers the repo-local `.venv` first when present.

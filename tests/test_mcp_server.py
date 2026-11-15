@@ -172,6 +172,9 @@ async def test_list_tools_and_server_resource(server):
             "list_recent_batches",
             "read_batch_manifest",
             "read_video_output",
+            "get_video_frames",
+            "analyze_video",
+            "compare_hooks",
             "check_health",
         }
 
@@ -332,3 +335,74 @@ async def test_check_health(server):
         assert payload["jobs"]["max_concurrent"] == mcp_server.MAX_CONCURRENT_JOBS
         assert "base" in payload["allowed_models"]
         assert isinstance(payload["problems"], list)
+
+
+@pytest.mark.anyio
+async def test_get_video_frames_returns_images(server, clean_outputs: Path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    from tests.test_frames import make_video
+
+    _write_batch(clean_outputs, "video_urls", "creator", "vid1")
+    video_dir = clean_outputs / "video_urls" / "creator" / "vid1"
+    (video_dir / "metadata.json").write_text(json.dumps({"video_id": "vid1", "video_url": "https://example.com/v", "segments": []}))
+    make_video(video_dir / "video.mp4", ["testsrc", "color=c=red", "smptebars"])
+
+    async with create_connected_server_and_client_session(server._mcp_server) as client:
+        args = {"source_group": "video_urls", "source_label": "creator", "video_id": "vid1"}
+        result = await client.call_tool("get_video_frames", args)
+        assert not result.isError
+        kinds = [item.type for item in result.content]
+        assert kinds == ["text", "image", "image", "image"]
+        summary = json.loads(result.content[0].text)
+        assert summary["status"] == "ok" and summary["frame_count"] == 3
+        assert result.content[1].mimeType == "image/jpeg"
+
+        result = await client.call_tool("get_video_frames", {**args, "include_images": False, "max_frames": 2})
+        assert [item.type for item in result.content] == ["text"]
+        assert json.loads(result.content[0].text)["frame_count"] == 2
+
+        result = await client.call_tool("get_video_frames", {**args, "video_id": "nope"})
+        assert json.loads(result.content[0].text)["error_type"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_analyze_video_and_compare_hooks_return_labelled_images(server, clean_outputs: Path, monkeypatch):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    from ig_transcriber import pipeline
+    from tests.test_frames import make_video
+
+    monkeypatch.setattr(pipeline, "_yt_dlp_extract_info", lambda url: (_ for _ in ()).throw(pipeline.PipelineError("offline")))
+    _write_batch(clean_outputs, "instagram_profiles", "creator", "vid1")
+    video_dir = clean_outputs / "instagram_profiles" / "creator" / "vid1"
+    (video_dir / "metadata.json").write_text(json.dumps({"video_id": "vid1", "video_url": "https://example.com/v", "segments": []}))
+    make_video(video_dir / "video.mp4", ["testsrc", "color=c=red"])
+    manifest = video_dir.parent / "manifest.json"
+    data = json.loads(manifest.read_text())
+    data["videos"][0].update({"status": "ok", "performance": {"multiplier": 1.5}})
+    manifest.write_text(json.dumps(data))
+
+    async with create_connected_server_and_client_session(server._mcp_server) as client:
+        prompts = await client.list_prompts()
+        assert [p.name for p in prompts.prompts] == ["hook_analysis"]
+        prompt = await client.get_prompt("hook_analysis", {"target": "https://www.instagram.com/x/"})
+        assert "compare_hooks" in prompt.messages[0].content.text and "Four gates" in prompt.messages[0].content.text
+
+        ids = {"source_group": "instagram_profiles", "source_label": "creator", "video_id": "vid1"}
+        result = await client.call_tool("analyze_video", {**ids, "question": "why?", "include_method": False})
+        packet = json.loads(result.content[0].text)
+        assert packet["status"] == "ok" and packet["question"] == "why?"
+        labels = [item.text for item in result.content[1:] if item.type == "text"]
+        assert labels[0] == "hook frame 0.0s | no speech"
+        assert sum(item.type == "image" for item in result.content) == len(packet["hook_frames"]) + len(packet["shot_frames"])
+
+        result = await client.call_tool("analyze_video", {"input_url": "https://www.instagram.com/someone/"})
+        assert "compare_hooks" in json.loads(result.content[0].text)["hint"]
+        result = await client.call_tool("analyze_video", {"question": "why?"})
+        assert json.loads(result.content[0].text)["error_type"] == "invalid_input"
+
+        result = await client.call_tool("compare_hooks", {"source_group": "instagram_profiles", "source_label": "creator"})
+        packet = json.loads(result.content[0].text)
+        assert packet["status"] == "ok" and len(packet["videos"]) == 1
+        assert result.content[1].text.startswith("[vid1 (1.5x median)] hook frame 0.0s")

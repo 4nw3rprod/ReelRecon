@@ -11,7 +11,8 @@
  * protocol and must stay clean.
  *
  * Environment:
- *   REELRECON_HOME    where the venv lives (default: ~/.reelrecon)
+ *   REELRECON_HOME    where the venv and the saved Instagram login live
+ *                     (default: ~/.reelrecon)
  *   REELRECON_PYTHON  bring-your-own interpreter with deps already
  *                     installed; skips venv provisioning entirely
  */
@@ -95,7 +96,7 @@ function run(command, args, description) {
 }
 
 function ensureVenv() {
-  const home = process.env.REELRECON_HOME || path.join(os.homedir(), '.reelrecon');
+  const home = reelreconHome();
   const venvDir = path.join(home, 'venv');
   const venvPython = venvPythonPath(venvDir);
 
@@ -143,12 +144,26 @@ function warnIfNoFfmpeg() {
   }
 }
 
+function reelreconHome() {
+  return process.env.REELRECON_HOME || path.join(os.homedir(), '.reelrecon');
+}
+
+function warnIfNoInstagramLogin() {
+  const env = (name) => process.env[`REELRECON_${name}`] || process.env[`IG_TRANSCRIBER_${name}`];
+  if (env('COOKIES_FILE') || env('COOKIES_FROM_BROWSER')) return;
+  if (fs.existsSync(path.join(reelreconHome(), 'instagram_cookies.txt'))) return;
+  log('Not connected to Instagram yet: profile scans need your login. Run once: npx -y reelrecon login');
+}
+
 function main() {
   const args = process.argv.slice(2);
 
   let script = path.join(packageRoot, 'mcp_server.py');
   let scriptArgs = args;
-  if (args[0] === 'transcribe') {
+  if (args[0] === 'login') {
+    script = '-m';
+    scriptArgs = ['ig_transcriber.login', ...args.slice(1)];
+  } else if (args[0] === 'transcribe') {
     script = path.join(packageRoot, 'transcribe_latest_reel.py');
     scriptArgs = args.slice(1);
   } else if (args[0] === '--version') {
@@ -158,11 +173,15 @@ function main() {
   }
 
   const python = resolvePython();
-  warnIfNoFfmpeg();
+  if (args[0] !== 'login') {
+    warnIfNoFfmpeg();
+    warnIfNoInstagramLogin();
+  }
 
   const child = spawn(python, [script, ...scriptArgs], {
     stdio: 'inherit',
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    // PYTHONPATH lets `-m ig_transcriber.login` resolve from any working directory.
+    env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONPATH: [packageRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) },
   });
 
   const forward = (signal) => {

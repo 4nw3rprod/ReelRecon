@@ -18,7 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import ToolAnnotations
 
 SERVER_NAME = "ReelRecon"
-SERVER_VERSION = "1.2.1"
+SERVER_VERSION = "1.3.0"
 
 logger = logging.getLogger("reelrecon.mcp")
 

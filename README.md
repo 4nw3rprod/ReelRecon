@@ -88,7 +88,9 @@ npx -y reelrecon transcribe "https://www.instagram.com/<username>/" --json
 - **GitHub-direct:** `npx -y github:4nw3rprod/ReelRecon` always runs the latest `main` — no npm release needed.
 - **Local clone:** `git pull`. That's it — the private Python env in `~/.reelrecon` is reused automatically and only reinstalls when `requirements.txt` changes.
 
-If Instagram login-walls you, run `npx -y reelrecon login` (above). Advanced: `REELRECON_COOKIES_FILE` / `REELRECON_COOKIES_FROM_BROWSER` in the MCP config's `env` still work and take priority over the saved login.
+**Upgrading to 1.3:** run `npx -y reelrecon@latest login` once. Instagram removed the endpoint older versions used for profile scans, so 1.3 reads profiles logged in as you. The first start after upgrading rebuilds the `~/.reelrecon` Python environment once (a few minutes), because 1.3 pins `mcp<2`: mcp 2.x renamed the server API and stops older ReelRecon installs from starting at all.
+
+If Instagram login-walls you later, run `npx -y reelrecon login` again. Advanced: `REELRECON_COOKIES_FILE` / `REELRECON_COOKIES_FROM_BROWSER` in the MCP config's `env` still work and take priority over the saved login.
 
 | Agent / Framework | Integration |
 |---|---|

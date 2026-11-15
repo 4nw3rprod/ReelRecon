@@ -14,6 +14,8 @@ sys.path.insert(0, str(REPO_ROOT))
 # directory before any test imports the module.
 _TEST_OUTPUT_ROOT = Path(tempfile.mkdtemp(prefix="reelrecon-test-outputs-"))
 os.environ["REELRECON_OUTPUT_DIR"] = str(_TEST_OUTPUT_ROOT)
+# Keep a real `reelrecon login` session on the dev machine out of the tests.
+os.environ["REELRECON_HOME"] = tempfile.mkdtemp(prefix="reelrecon-test-home-")
 
 
 @pytest.fixture

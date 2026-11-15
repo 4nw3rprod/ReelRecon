@@ -12,7 +12,8 @@
 [![Privacy](https://img.shields.io/badge/runs-locally-orange)](#)
 
 ```bash
-npx -y reelrecon
+npx -y reelrecon login   # step 1: connect your Instagram (once)
+npx -y reelrecon         # step 2: start the MCP server
 ```
 
 *Your agent can already write scripts. Now it can study the competition first:*
@@ -42,9 +43,30 @@ Built agent-tough: structured errors instead of exceptions, progress notificatio
 
 The server speaks **stdio and streamable-HTTP MCP**, so anything MCP-capable can use it. No MCP? There's a JSON-mode CLI any framework can shell out to.
 
-### ⚡ One command, no clone: `npx`
+### 🔑 Step 1: connect your Instagram (once)
+
+Instagram hides profile listings from logged-out visitors, so ReelRecon uses **your** login. You don't type a password anywhere: it borrows the session from a browser you're already logged in to.
 
 With Node 18+, Python 3.10+ (3.11 recommended), and `ffmpeg` installed:
+
+```bash
+npx -y reelrecon login
+```
+
+1. Pick the browser you use Instagram in (Chrome, Safari, Firefox, Edge, Brave, Arc, …).
+2. It opens instagram.com; log in there if you aren't already, then press Enter.
+3. Your OS may ask to allow access to the browser's saved data (on macOS, a Keychain prompt for Chrome-family browsers). Allow it.
+4. ReelRecon checks the login with Instagram and saves it to `~/.reelrecon/instagram_cookies.txt`, readable only by you. Every run, including your MCP agents, uses it automatically.
+
+```bash
+npx -y reelrecon login --status    # is it connected and still working?
+npx -y reelrecon login --logout    # delete the saved login
+npx -y reelrecon login --cookies-file ~/Downloads/cookies.txt   # or import a cookies.txt export
+```
+
+> **Treat that file like a password.** It's a live login to your account. Consider a secondary Instagram account for research: heavy automated use can get an account rate-limited or checkpointed. If Instagram logs you out later, just run `login` again.
+
+### ⚡ Step 2: start the server, no clone needed
 
 ```bash
 npx -y reelrecon
@@ -66,19 +88,7 @@ npx -y reelrecon transcribe "https://www.instagram.com/<username>/" --json
 - **GitHub-direct:** `npx -y github:4nw3rprod/ReelRecon` always runs the latest `main` — no npm release needed.
 - **Local clone:** `git pull`. That's it — the private Python env in `~/.reelrecon` is reused automatically and only reinstalls when `requirements.txt` changes.
 
-If Instagram login-walled you on a public reel, upgrade to **v1.2.1+** and (optionally) hand the server your own session in the MCP config:
-
-```json
-{
-  "mcpServers": {
-    "reelrecon": {
-      "command": "npx",
-      "args": ["-y", "reelrecon@latest"],
-      "env": { "REELRECON_COOKIES_FILE": "/absolute/path/to/cookies.txt" }
-    }
-  }
-}
-```
+If Instagram login-walls you, run `npx -y reelrecon login` (above). Advanced: `REELRECON_COOKIES_FILE` / `REELRECON_COOKIES_FROM_BROWSER` in the MCP config's `env` still work and take priority over the saved login.
 
 | Agent / Framework | Integration |
 |---|---|
@@ -182,6 +192,9 @@ stdout is a single JSON object on success; non-zero exit + `{"status":"error","e
 
 Point any LLM at the structured output and competitive content research becomes a conversation:
 
+- **🚀 Outlier detection** — every video is scored against the creator's own median (views, or likes + comments when views are hidden). The 2x+ outliers come back ranked, with the exact words spoken in their first 3 seconds. Your agent learns what *worked*, not just what was posted.
+- **🧠 Built-in hook analysis** — ask "why did this reel pop?" and `analyze_video` hands your agent the frames, the cover, the timed speech, and the numbers, plus a method to judge them: four pass/fail gates (works muted? sight and sound agree? body pays off the hook? genuinely different?), seven strong/adequate/weak bands with no fake scores, a read of the cover and the creator's persuasion levers, and the single cheapest fix. `compare_hooks` runs it across a whole profile and checks the analysis against which reels actually won.
+- **🎞️ Visual analysis** — `get_video_frames` cuts a reel into its shots and hands your agent the frames as images, each tagged with its timestamp and the line being spoken. Text overlays, B-roll, on-screen hooks: things the transcript can't show.
 - **🪝 Hook mining** — the opening line of a competitor's last 10 videos, side by side. Your agent extracts the formula.
 - **📣 CTA patterns** — every "follow / comment / link in bio / DM me" detected and counted per batch.
 - **🧬 Script structure** — full transcripts expose pacing: hook → context → payoff → CTA. Steal the skeleton, not the words.
@@ -191,6 +204,16 @@ Point any LLM at the structured output and competitive content research becomes 
 - **🕵️ Scheduled watching** — pair with your agent's cron/loop feature: "check these 3 profiles every morning and brief me."
 
 > **Fair use, please:** public profiles only (private accounts are detected and refused), and it's built for research and inspiration — study patterns, don't plagiarize scripts. Instagram may rate-limit anonymous requests; be a good citizen.
+
+### 🧩 The hook-analyzer skill
+
+The analysis method ships with the server (tool results, the `hook_analysis` prompt, and the `reelrecon://method/hook-analysis` resource), and also as a standalone Agent Skill for Claude Code and other skill-aware agents:
+
+```bash
+npx skills add https://github.com/4nw3rprod/ReelRecon --skill reelrecon-hook-analyzer
+```
+
+Its gate / band / pairwise-ranking structure is adapted, with credit, from [`ad-hook-analyzer`](https://github.com/mbfinotti/advertising-skills) (MIT, Nativa Labs) and rewritten for published reels with real frames, covers, speech timing, and performance.
 
 ## ⚙️ How it works
 
@@ -218,6 +241,7 @@ git clone https://github.com/4nw3rprod/ReelRecon.git
 cd ReelRecon
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m ig_transcriber.login   # connect your Instagram (same flow as `npx -y reelrecon login`)
 ```
 
 Optional (Groq-powered insights instead of the built-in heuristics):
@@ -232,6 +256,9 @@ Connect your agent ([see configs above](#-drop-it-into-your-agent-stack)), or ru
 # A competitor's latest 10 videos
 ./run_latest_reel_transcription.sh "https://www.instagram.com/nike/" --json
 
+# Same, plus key frames from every video for visual analysis
+./run_latest_reel_transcription.sh "https://www.instagram.com/nike/" --json --frames
+
 # A single Reel, with model + language hints
 ./run_latest_reel_transcription.sh "https://www.instagram.com/reel/<id>/" --json --model small --language en
 ```
@@ -245,9 +272,12 @@ Connect your agent ([see configs above](#-drop-it-into-your-agent-stack)), or ru
 | `list_recent_batches` | Browse saved runs |
 | `read_batch_manifest` | Load a full batch result |
 | `read_video_output` | Load one video's transcript + metadata |
+| `analyze_video` | One video, one call: frames across the first 3 seconds + one per shot, the cover image, timed speech, measured signals, performance vs. the creator's median, and the hook-analysis method. Pass the user's question |
+| `compare_hooks` | A whole batch side by side: every cover (the creator's grid) and every first 3 seconds, against real performance |
+| `get_video_frames` | The video's key frames as images (one per shot change, 512px), each with its timestamp and the words spoken then |
 | `check_health` | Self-diagnose ffmpeg/Whisper/yt-dlp, disk, and job status |
 
-Resources: `reelrecon://server` · `reelrecon://recent-batches` · `reelrecon://manifest/{group}/{label}` · `reelrecon://transcript/{group}/{label}/{video_id}`
+Prompt: `hook_analysis(target, question)` · Resources: `reelrecon://method/hook-analysis` · `reelrecon://server` · `reelrecon://recent-batches` · `reelrecon://manifest/{group}/{label}` · `reelrecon://transcript/{group}/{label}/{video_id}`
 
 **The contract your agent can rely on:**
 
@@ -267,7 +297,9 @@ outputs/
         └── <video_id>/
             ├── audio.mp3
             ├── transcript.txt     ← the gold
-            └── metadata.json      ← caption, timestamps, insights
+            ├── metadata.json      ← caption, metrics, timed segments, insights
+            ├── video.mp4          ← only with frames on
+            └── frames/            ← key frames (JPEG, 512px)
 ```
 
 ```jsonc
@@ -280,6 +312,9 @@ outputs/
     {
       "title": "You don't need motivation…",
       "transcript_text": "...",
+      "metrics": { "views": null, "likes": 48210, "comments": 912, "duration_seconds": 31.4 },
+      "speech": { "first_3s": "You don't need motivation.", "speech_starts_at": 0.2, "words_per_minute": 182 },
+      "performance": { "metric": "engagement", "multiplier": 3.4, "is_outlier": true },
       "ai_insights": {
         "hook": "You don't need motivation, you need a system.",
         "cta": "follow",
@@ -290,6 +325,14 @@ outputs/
       }
     }
   ],
+  "performance": {
+    "metric": "engagement",
+    "median": 14180,
+    "outliers": [
+      { "video_id": "C8x9Y2mP", "multiplier": 3.4, "first_3s": "You don't need motivation.", "words_per_minute": 182 }
+    ],
+    "ranking": ["…every scored video, best first…"]
+  },
   "ai_overview": {
     "recurring_keywords": ["..."],
     "top_hooks": ["..."],
@@ -322,8 +365,10 @@ All optional, via environment variables:
 | `REELRECON_MAX_CONCURRENT_JOBS` | `1` | Parallel transcription jobs (MCP) |
 | `REELRECON_MAX_UPLOAD_BYTES` | 2 GiB | Max local audio file size (MCP) |
 | `REELRECON_EXTRA_MODELS` | — | Comma-separated extra Whisper model names to allow |
-| `REELRECON_COOKIES_FILE` | — | Path to a `cookies.txt` export of your own Instagram session (fallback when Instagram login-walls anonymous access) |
-| `REELRECON_COOKIES_FROM_BROWSER` | — | Read your session straight from a browser, e.g. `chrome` or `firefox:ProfileName` |
+| `REELRECON_COOKIES_FILE` | — | Path to a `cookies.txt` export of your Instagram session. Overrides the login saved by `reelrecon login` |
+| `REELRECON_COOKIES_FROM_BROWSER` | — | Read your session straight from a browser on every download, e.g. `chrome` (reels only; profile scans need `reelrecon login`) |
+| `REELRECON_REELS_DOC_ID` | built in | Instagram's GraphQL query ID for a profile's Reels tab. Instagram rotates it now and then; if profile scans report an "unexpected response", set the new one here (or update ReelRecon) |
+| `REELRECON_HOME` | `~/.reelrecon` | Where the npx Python env and the saved Instagram login live |
 | `REELRECON_HTTP_TIMEOUT_SECONDS` | `30` | Instagram/Groq/yt-dlp socket timeout |
 | `REELRECON_FETCH_RETRIES` | `3` | Instagram profile fetch attempts (with backoff) |
 
@@ -344,7 +389,8 @@ The MCP server and pipeline helpers ship with a lightweight suite (no Whisper/to
 
 - **Public profiles only** — private accounts are detected and refused.
 - Instagram may rate-limit anonymous requests; the tool retries with backoff, but if it's blocked, wait and rerun.
-- **Hitting Instagram's login wall on a public reel?** Public videos normally work anonymously (the same access you get after dismissing the login popup in a browser). If Instagram keeps refusing, supply your own logged-in session: set `REELRECON_COOKIES_FILE` to a `cookies.txt` export, or `REELRECON_COOKIES_FROM_BROWSER=chrome`. Your session, your account, your responsibility — keep it to research-scale use.
+- **Profile scans read the Reels tab** (latest 10 reels, pinned ones skipped) through the same request instagram.com uses, logged in as you. That's also why view counts are real. Instagram changes that request occasionally; see `REELRECON_REELS_DOC_ID` above.
+- **Hitting Instagram's login wall?** Run `npx -y reelrecon login` (or again, if your session expired). Profile scans always need it; single public reels usually work without it. Your session, your account, your responsibility — keep it to research-scale use.
 - Whisper models are cached after first load; already-transcribed videos are reused on reruns.
 - Everything runs locally. The only network calls are to Instagram/video hosts, and (optionally) GroqCloud with your key.
 - Agent-facing docs live in [`CLAUDE.md`](CLAUDE.md) — most MCP-aware coding agents pick it up automatically.

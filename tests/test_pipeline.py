@@ -144,7 +144,56 @@ def test_download_error_login_wall_hint():
         "https://www.instagram.com/reel/abc/",
         "downloading audio for",
     )
-    assert "REELRECON_COOKIES_FILE" in str(err)
+    assert "reelrecon login" in str(err)
 
     plain = pipeline._download_error(Exception("connection reset"), "https://example.com/v", "inspecting")
-    assert "REELRECON_COOKIES_FILE" not in str(plain)
+    assert "reelrecon login" not in str(plain)
+
+
+def _ok_video(video_id: str, **metrics):
+    base = {"views": None, "likes": None, "comments": None, "duration_seconds": None}
+    return {"status": "ok", "video_id": video_id, "title": video_id, "metrics": {**base, **metrics}, "speech": {"first_3s": f"hook {video_id}"}}
+
+
+def test_analyze_performance_uses_views_when_all_present():
+    videos = [_ok_video("a", views=100), _ok_video("b", views=120), _ok_video("c", views=400), {"status": "error", "video_id": "d"}]
+    result = pipeline.analyze_performance(videos)
+    assert result["available"] and result["metric"] == "views"
+    assert result["median"] == 120
+    assert [o["video_id"] for o in result["outliers"]] == ["c"]
+    assert result["outliers"][0]["first_3s"] == "hook c"
+    assert videos[2]["performance"]["is_outlier"] is True
+    assert videos[0]["performance"]["multiplier"] == 0.83
+    assert "performance" not in videos[3]
+
+
+def test_analyze_performance_falls_back_to_engagement():
+    videos = [_ok_video("a", views=500, likes=10, comments=0), _ok_video("b", likes=10, comments=2), _ok_video("c", likes=50, comments=10)]
+    result = pipeline.analyze_performance(videos)
+    assert result["metric"] == "engagement"
+    assert [r["value"] for r in result["ranking"]] == [60, 12, 10]
+    assert result["outliers"][0]["video_id"] == "c"
+
+
+def test_analyze_performance_needs_enough_data():
+    assert pipeline.analyze_performance([_ok_video("a", likes=5), _ok_video("b")])["available"] is False
+    assert pipeline.analyze_performance([_ok_video(x, likes=0) for x in "abc"])["available"] is False
+
+
+def test_speech_profile():
+    segments = [{"start": 0.4, "end": 2.0, "text": " Stop scrolling."}, {"start": 2.5, "end": 6.0, "text": "Here is why."}, {"start": 6.0, "end": 12.4, "text": "  "}]
+    profile = pipeline.speech_profile(segments, "Stop scrolling. Here is why.")
+    assert profile["first_3s"] == "Stop scrolling. Here is why."
+    assert profile["opening_line"] == "Stop scrolling."
+    assert profile["speech_starts_at"] == 0.4
+    assert profile["words_per_minute"] == round(5 / (5.6 / 60))
+    assert pipeline.speech_profile([], "")["has_speech"] is False
+
+
+def test_metrics_extraction_and_merge():
+    media = {"play_count": 900, "view_count": 5, "like_count": 40, "comment_count": 3, "video_duration": 12.34}
+    assert pipeline.metrics_from_reel_media(media) == {"views": 900, "likes": 40, "comments": 3, "duration_seconds": 12.3}
+    assert pipeline.metrics_from_reel_media({"view_count": 5})["views"] == 5
+    info = pipeline.metrics_from_yt_dlp_info({"like_count": 107621, "comment_count": 1338, "view_count": None})
+    assert info == {"views": None, "likes": 107621, "comments": 1338, "duration_seconds": None}
+    assert pipeline.merge_metrics({"views": None, "likes": 5}, {"views": 77, "likes": 9}) == {"views": 77, "likes": 5, "comments": None, "duration_seconds": None}

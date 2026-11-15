@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import ToolAnnotations
 
 SERVER_NAME = "ReelRecon"
@@ -43,6 +43,7 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = Path(_env("OUTPUT_DIR", str(REPO_ROOT / "outputs"))).expanduser().resolve()
 MAX_LIST_LIMIT = 50
+MAX_FRAMES_LIMIT = 60
 JOB_TIMEOUT_SECONDS = _env_int("JOB_TIMEOUT_SECONDS", 3600, minimum=30)
 QUEUE_TIMEOUT_SECONDS = _env_int("QUEUE_TIMEOUT_SECONDS", 900, minimum=5)
 MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 1, minimum=1)
@@ -342,6 +343,24 @@ def _validate_limit(limit: int) -> int:
         return 10
 
 
+def _validate_frame_count(max_frames: int) -> int:
+    try:
+        return min(max(int(max_frames), 1), MAX_FRAMES_LIMIT)
+    except (TypeError, ValueError):
+        return 12
+
+
+def _frame_images(groups: list[tuple[str, list[dict[str, Any]]]]) -> list[Any]:
+    """Each frame image preceded by a one-line label, so the model can tie pictures to the JSON packet."""
+    content: list[Any] = []
+    for label, frames in groups:
+        for frame in frames:
+            spoken = frame.get("spoken")
+            content.append(f"{label} {frame['time_seconds']}s" + (f' | spoken: "{spoken}"' if spoken else " | no speech"))
+            content.append(Image(path=frame["file"]))
+    return content
+
+
 def _validate_slug_input(value: str, field: str) -> tuple[str | None, dict[str, Any] | None]:
     cleaned = (value or "").strip()
     if not cleaned:
@@ -513,8 +532,15 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
         instructions=(
             "Use this server to transcribe a direct video URL, the latest 10 videos from a public Instagram "
             "profile, or a local audio file. The main tool is transcribe_input. Use list_recent_batches, "
-            "read_batch_manifest, and read_video_output to inspect prior results, and check_health to diagnose "
-            "setup problems. All tools return JSON objects with a 'status' field: 'ok' on success, or 'error' "
+            "read_batch_manifest, and read_video_output to inspect prior results. For any question about a video's hook, "
+            "visuals, or why it performed, call analyze_video (one video) or compare_hooks (a whole batch): they return "
+            "frames as images, timed speech, measured signals, performance, and the analysis method to follow. "
+            "get_video_frames to see a video's "
+            "key frames as images (visual analysis), and check_health to diagnose "
+            "setup problems; if it reports no Instagram session, ask the user to run `npx -y reelrecon login` in a "
+            "terminal, since profile scans need it. Batch results include a 'performance' block that ranks each video against the batch "
+            "median (views, or likes + comments when views are hidden) and lists outliers at 2x or more, with the "
+            "words spoken in each video's first 3 seconds; start analysis from the outliers. All tools return JSON objects with a 'status' field: 'ok' on success, or 'error' "
             "with 'error_type', 'error', and usually a 'hint' on failure — tool calls never raise for expected "
             "failures. Long transcriptions report progress notifications; set include_transcript_text=false or "
             "max_transcript_chars to keep responses small."
@@ -541,6 +567,9 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
                     "list_recent_batches",
                     "read_batch_manifest",
                     "read_video_output",
+                    "get_video_frames",
+                    "analyze_video",
+                    "compare_hooks",
                     "check_health",
                 ],
                 "input_support": {
@@ -548,6 +577,7 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
                     "video_url": "Transcribes a single direct video URL.",
                     "local_audio": "Transcribes a local audio file path.",
                 },
+                "performance": "Batch results rank videos against the batch median (views, else likes + comments) and flag outliers at 2x+, with each video's first 3 spoken seconds.",
                 "error_contract": {
                     "status": "'ok' or 'error'",
                     "error_type": "invalid_input | dependency_error | output_dir_error | pipeline_error | not_found | server_busy | timeout | internal_error",
@@ -559,7 +589,9 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "max_list_limit": MAX_LIST_LIMIT,
                 },
+                "prompts": ["hook_analysis"],
                 "resources": [
+                    "reelrecon://method/hook-analysis",
                     "reelrecon://server",
                     "reelrecon://recent-batches",
                     "reelrecon://manifest/{source_group}/{source_label}",
@@ -609,7 +641,11 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
             "(tiny/base/small/medium/large*, default 'base'). language: optional ISO hint like 'en' (omit for "
             "auto-detect). reuse_existing: reuse cached transcripts for already-processed videos. Set "
             "include_transcript_text=false or max_transcript_chars>0 to shrink the response; full text stays "
-            "on disk and via resources. Long profile batches can take many minutes — progress is streamed via "
+            "on disk and via resources. The result's 'performance' block ranks videos by views (or likes + comments) "
+            "relative to the batch median and flags outliers; each video also carries 'metrics' and 'speech' "
+            "(first_3s, words_per_minute, speech_starts_at). include_frames=true also downloads each video and saves "
+            "key frames (one per shot change, max_frames each) as file paths; use get_video_frames to view them. "
+            "Long profile batches can take many minutes — progress is streamed via "
             "MCP progress notifications."
         ),
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
@@ -622,6 +658,8 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
         reuse_existing: bool = True,
         include_transcript_text: bool = True,
         max_transcript_chars: int = 0,
+        include_frames: bool = False,
+        max_frames: int = 12,
     ) -> dict[str, Any]:
         url, url_error = _validate_url(input_url)
         if url_error:
@@ -651,6 +689,8 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
             language=lang,
             progress_callback=progress_callback,
             reuse_existing=reuse_existing,
+            include_frames=include_frames,
+            max_frames=_validate_frame_count(max_frames),
         )
         if result.get("status") != "ok":
             return result
@@ -896,6 +936,218 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
 
     @mcp.tool(
         description=(
+            "Get a processed video's key frames for visual analysis: one frame per shot change plus the opening "
+            "frame, downscaled to 512px wide, each with its timestamp and the words spoken at that moment. "
+            "Identify the video by source_group, source_label, and video_id (from a transcribe call, "
+            "list_recent_batches, or read_batch_manifest). The first call downloads the video; later calls reuse "
+            f"it. max_frames: 1-{MAX_FRAMES_LIMIT}, default 12. include_images=false returns only file paths."
+        ),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    )
+    async def get_video_frames(
+        source_group: str,
+        source_label: str,
+        video_id: str,
+        ctx: Context,
+        max_frames: int = 12,
+        include_images: bool = True,
+    ):
+        group, group_error = _validate_slug_input(source_group, "source_group")
+        if group_error:
+            return group_error
+        label, label_error = _validate_slug_input(source_label, "source_label")
+        if label_error:
+            return label_error
+        video, video_error = _validate_slug_input(video_id, "video_id")
+        if video_error:
+            return video_error
+        try:
+            run_dir = _video_dir(group, label, video)
+        except FileNotFoundError as exc:
+            return _error("invalid_input", str(exc))
+        metadata_path = run_dir / "metadata.json"
+        if not metadata_path.exists():
+            return _error(
+                "not_found",
+                f"Video output not found for {group}/{label}/{video}",
+                hint="Transcribe the video first (transcribe_input), or call read_batch_manifest for valid video_id values.",
+                available_batches=_known_batches(),
+            )
+        try:
+            video_url = _load_json(metadata_path).get("video_url") or ""
+        except (OSError, json.JSONDecodeError) as exc:
+            return _error("internal_error", f"Metadata for {group}/{label}/{video} could not be read: {exc}")
+        preflight_error = _preflight_transcription()
+        if preflight_error:
+            return preflight_error
+
+        pipeline = _pipeline()
+
+        def extract() -> dict[str, Any]:
+            frames = pipeline.frames_for_video(run_dir, video_url, max_frames=_validate_frame_count(max_frames))
+            return {"status": "ok", "video_url": video_url, "frame_count": len(frames), "frames": frames}
+
+        result = await _run_pipeline_job(ctx, f"Frame extraction for {group}/{label}/{video}", extract)
+        if result.get("status") != "ok" or not include_images:
+            return result
+        # Text summary first, then one image per frame, in timeline order.
+        return [result, *(Image(path=frame["file"]) for frame in result["frames"])]
+
+    @mcp.resource("reelrecon://method/hook-analysis")
+    def hook_method_resource() -> str:
+        return _pipeline().analysis_method()
+
+    @mcp.prompt(
+        name="hook_analysis",
+        description="Analyze a reel's hook (or a whole profile's hooks) from frames, timed speech, and real performance.",
+    )
+    def hook_analysis_prompt(target: str, question: str = "") -> str:
+        ask = question.strip() or "Why does this opening work or not, and what is the cheapest improvement?"
+        return (
+            f"Target: {target}\nQuestion: {ask}\n\n"
+            "If the target is a single video URL or saved video, call analyze_video with it and this question. "
+            "If it is a profile, call transcribe_input on it and then compare_hooks on the resulting batch. "
+            "Then follow this method exactly:\n\n" + _pipeline().analysis_method()
+        )
+
+    @mcp.tool(
+        description=(
+            "Analyze one video for the user's question: its hook (first 3 seconds), visuals, and how sight and "
+            "speech line up. Pass input_url (any single reel/video URL; transcribed first if new) or the "
+            "source_group/source_label/video_id of a saved video, plus the user's question. Returns a JSON packet "
+            "(measured signals, timed speech, performance vs. the creator's median when known, and the analysis "
+            "method to follow) followed by the cover image (when available) and labelled frame images: dense frames across the first 3 seconds, then "
+            "one per shot. include_method=false skips the method text on follow-up calls."
+        ),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    )
+    async def analyze_video(
+        ctx: Context,
+        input_url: str | None = None,
+        source_group: str | None = None,
+        source_label: str | None = None,
+        video_id: str | None = None,
+        question: str | None = None,
+        model_name: str = "base",
+        max_shot_frames: int = 8,
+        include_images: bool = True,
+        include_method: bool = True,
+    ):
+        pipeline_error = _preflight_transcription()
+        if pipeline_error:
+            return pipeline_error
+        pipeline = _pipeline()
+        shot_limit = _validate_frame_count(max_shot_frames)
+
+        if input_url:
+            url, url_error = _validate_url(input_url)
+            if url_error:
+                return url_error
+            try:
+                kind, _ = pipeline.detect_input_kind(url)
+            except pipeline.PipelineError as exc:
+                return _error("invalid_input", str(exc))
+            if kind == "instagram_profile":
+                return _error(
+                    "invalid_input",
+                    "analyze_video takes one video; that is a profile URL.",
+                    hint="Call transcribe_input on the profile, then compare_hooks with its source_group/source_label.",
+                )
+            model, model_error = _validate_model(model_name)
+            if model_error:
+                return model_error
+
+            def run() -> dict[str, Any]:
+                batch = pipeline.run_transcription(url, output_dir=DEFAULT_OUTPUT_DIR, model_name=model)
+                run_dir = Path(batch["videos"][0]["metadata_file"]).parent
+                return pipeline.build_video_analysis(run_dir, question=question, max_shot_frames=shot_limit, include_method=include_method)
+        else:
+            fields = {"source_group": source_group, "source_label": source_label, "video_id": video_id}
+            missing = [name for name, value in fields.items() if not (value or "").strip()]
+            if missing:
+                return _error(
+                    "invalid_input",
+                    "Pass input_url, or all of source_group, source_label and video_id.",
+                    hint="list_recent_batches and read_batch_manifest show saved videos.",
+                )
+            try:
+                run_dir = _video_dir(source_group, source_label, video_id)
+            except FileNotFoundError as exc:
+                return _error("invalid_input", str(exc))
+            if not (run_dir / "metadata.json").exists():
+                return _error("not_found", f"Video output not found for {source_group}/{source_label}/{video_id}", available_batches=_known_batches())
+
+            def run() -> dict[str, Any]:
+                return pipeline.build_video_analysis(run_dir, question=question, max_shot_frames=shot_limit, include_method=include_method)
+
+        packet = await _run_pipeline_job(ctx, "Video analysis", run)
+        if packet.get("status") != "ok" or not include_images:
+            return packet
+        content = [packet]
+        if packet.get("cover"):
+            content += ["cover image (profile grid / share thumbnail)", Image(path=packet["cover"]["file"])]
+        return content + _frame_images([("hook frame", packet["hook_frames"]), ("shot frame", packet["shot_frames"])])
+
+    @mcp.tool(
+        description=(
+            "Compare the hooks of every video in a saved batch (e.g. a profile from transcribe_input): each video's "
+            "cover image (together: the creator's profile grid) and first 3 seconds as labelled frames (0s, 1s, 2s, 3s) "
+            "with its spoken words, measured signals, and real "
+            "performance against the creator's median, plus the analysis method. Use it to find what the "
+            f"over-performing openings share. max_videos: 1-{MAX_LIST_LIMIT}, default 10."
+        ),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    )
+    async def compare_hooks(
+        source_group: str,
+        source_label: str,
+        ctx: Context,
+        max_videos: int = 10,
+        include_images: bool = True,
+        include_method: bool = True,
+    ):
+        group, group_error = _validate_slug_input(source_group, "source_group")
+        if group_error:
+            return group_error
+        label, label_error = _validate_slug_input(source_label, "source_label")
+        if label_error:
+            return label_error
+        try:
+            manifest = _manifest_path(group, label)
+        except FileNotFoundError as exc:
+            return _error("invalid_input", str(exc))
+        if not manifest.exists():
+            return _error("not_found", f"Manifest not found for {group}/{label}", hint="Call transcribe_input on the profile first.", available_batches=_known_batches())
+        preflight_error = _preflight_transcription()
+        if preflight_error:
+            return preflight_error
+        pipeline = _pipeline()
+        packet = await _run_pipeline_job(
+            ctx,
+            f"Hook comparison for {group}/{label}",
+            pipeline.build_hook_comparison,
+            manifest.parent,
+            max_videos=_validate_limit(max_videos),
+            include_method=include_method,
+        )
+        if packet.get("status") != "ok" or not include_images:
+            return packet
+        groups = []
+        for video in packet["videos"]:
+            perf = video.get("performance") or {}
+            tag = f"{video['video_id']} ({perf['multiplier']}x median)" if perf.get("multiplier") is not None else video["video_id"]
+            groups.append((f"[{tag}] hook frame", video.get("hook_frames") or []))
+        content: list[Any] = [packet]
+        # Covers first, in batch order: together they are the creator's profile grid.
+        for video in packet["videos"]:
+            if video.get("cover"):
+                perf = video.get("performance") or {}
+                tag = f"{video['video_id']} ({perf['multiplier']}x median)" if perf.get("multiplier") is not None else video["video_id"]
+                content += [f"[{tag}] cover image", Image(path=video["cover"]["file"])]
+        return content + _frame_images(groups)
+
+    @mcp.tool(
+        description=(
             "Check server health: dependency status (whisper, yt-dlp, ffmpeg), output directory writability, "
             "GroqCloud configuration, job limits, and current job activity. Call this first when transcription "
             "tools fail unexpectedly."
@@ -915,7 +1167,18 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
         except OSError:
             pass
 
+        session = None
+        try:
+            session = _pipeline().session_source()
+        except Exception:
+            pass
+
         problems = []
+        if session is None:
+            problems.append(
+                "not connected to Instagram: profile scans will fail. Ask the user to run `npx -y reelrecon login` "
+                "in a terminal (it imports their browser's Instagram login); single public reels may still work"
+            )
         if not ffmpeg_path:
             problems.append("ffmpeg is not on PATH")
         if not output_root_writable:
@@ -936,7 +1199,8 @@ def build_server(*, host: str, port: int, debug: bool) -> FastMCP:
             "output_root_writable": output_root_writable,
             "saved_batches": len(_recent_manifest_paths(MAX_LIST_LIMIT)),
             "groq_configured": bool(os.environ.get("GROQ_API_KEY")),
-            "instagram_cookies_configured": bool(_env("COOKIES_FILE") or _env("COOKIES_FROM_BROWSER")),
+            "instagram_cookies_configured": session is not None,
+            "instagram_session": session,
             "jobs": {
                 "active": _active_jobs,
                 "abandoned_after_timeout": _abandoned_jobs,
